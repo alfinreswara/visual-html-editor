@@ -1,3 +1,5 @@
+export * from "./templates/index";
+
 export interface ProjectTemplate {
   id: "kosong" | "landing";
   name: string;

@@ -80,6 +80,9 @@ function rewriteHtmlDocument(
   htmlPath: string,
   urlMap: Map<string, string>,
 ): string {
+  if (typeof DOMParser === "undefined") {
+    return html;
+  }
   const doc = new DOMParser().parseFromString(html, "text/html");
 
   doc.querySelectorAll("link[href]").forEach((element) => {
@@ -159,6 +162,7 @@ function rewriteHtmlDocument(
 export function buildProjectPreview(
   files: ProjectFiles,
   htmlPath: string,
+  options?: { sessionToken?: string; parentOrigin?: string; withBridge?: boolean },
 ): ProjectPreview {
   const html = getTextFile(files, htmlPath);
   if (!html) {
@@ -197,7 +201,14 @@ export function buildProjectPreview(
     }
 
     const transformed = rewriteHtmlDocument(html, htmlPath, urlMap);
-    return { srcDoc: buildPreviewDocument(transformed), urls };
+    const withBridge = options?.withBridge !== false;
+    const srcDoc = withBridge
+      ? buildPreviewDocument(transformed, {
+          sessionToken: options?.sessionToken,
+          parentOrigin: options?.parentOrigin,
+        })
+      : transformed;
+    return { srcDoc, urls };
   } catch (error) {
     for (const url of urls) URL.revokeObjectURL(url);
     throw error;

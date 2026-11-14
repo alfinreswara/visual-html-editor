@@ -9,6 +9,7 @@ import {
   type ProjectSummary,
 } from "@/lib/project-files";
 import type { GlobalTheme } from "@/lib/style-files";
+import type { SavedSection } from "@/lib/saved-sections";
 
 export interface ProjectVersion {
   id: string;
@@ -38,6 +39,7 @@ export interface Project {
   versions?: ProjectVersion[];
   pageOrder?: string[];
   globalTheme?: GlobalTheme;
+  savedSections?: SavedSection[];
 }
 
 export const PROJECTS_STORAGE_KEY = "kanvas.projects.v1";

@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import { loader, type BeforeMount, type OnMount } from "@monaco-editor/react";
 import { Braces, CheckCircle2 } from "lucide-react";
@@ -70,10 +71,6 @@ const defineTheme: BeforeMount = (monaco) => {
   });
 };
 
-const handleMount: OnMount = (editor) => {
-  editor.updateOptions({ padding: { top: 16, bottom: 24 } });
-};
-
 export default function CodePane({
   path,
   language,
@@ -85,6 +82,24 @@ export default function CodePane({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const editorRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (editorRef.current) {
+      const model = editorRef.current.getModel();
+      if (model && model.getValue() !== value) {
+        editorRef.current.setValue(value);
+      }
+    }
+  }, [value, path]);
+
+  const handleMount: OnMount = (editor) => {
+    editorRef.current = editor;
+    if (typeof window !== "undefined") {
+      (window as any).__kanvasEditor = editor;
+    }
+    editor.updateOptions({ padding: { top: 16, bottom: 24 } });
+  };
   const lineCount = value ? value.split("\n").length : 1;
 
   return (
@@ -110,6 +125,7 @@ export default function CodePane({
       </div>
       <div className="relative min-h-0 flex-1">
         <MonacoEditor
+          key={path}
           height="100%"
           path={path}
           language={language}

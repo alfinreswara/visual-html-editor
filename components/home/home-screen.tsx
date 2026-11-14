@@ -53,6 +53,7 @@ import {
   PROJECT_TEMPLATES,
   type ProjectTemplate,
 } from "@/lib/templates";
+import TemplateGallery from "@/components/templates/template-gallery";
 import { cn } from "@/lib/utils";
 
 const PREVIEW_PALETTES = [
@@ -378,6 +379,7 @@ export default function HomeScreen() {
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [uploading, setUploading] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [mainTab, setMainTab] = useState<"projects" | "templates">("projects");
 
   useEffect(() => {
     setProjects(readProjects());
@@ -512,6 +514,20 @@ export default function HomeScreen() {
           <Brand />
         </Link>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setMainTab(mainTab === "templates" ? "projects" : "templates")}
+            data-testid="nav-templates-btn"
+            className={cn(
+              "focus-ring inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition",
+              mainTab === "templates"
+                ? "border-blue-500/40 bg-blue-500/10 text-blue-300"
+                : "border-white/[0.09] bg-white/[0.025] text-zinc-300 hover:border-white/[0.15] hover:bg-white/[0.045] hover:text-white",
+            )}
+          >
+            <LayoutTemplate className="size-3.5 text-blue-400" />
+            <span>Pustaka Template</span>
+          </button>
           <div className="mr-1 hidden items-center gap-1.5 text-[11px] text-zinc-500 sm:flex">
             <HardDrive className="size-3.5" />
             Tersimpan lokal
@@ -576,6 +592,15 @@ export default function HomeScreen() {
               </button>
               <button
                 type="button"
+                onClick={() => setMainTab("templates")}
+                data-testid="hero-explore-templates-btn"
+                className="focus-ring inline-flex h-11 items-center gap-2 rounded-xl border border-white/[0.12] bg-white/[0.04] px-4 text-[13px] font-medium text-zinc-200 transition hover:border-white/[0.2] hover:bg-white/[0.08] hover:text-white"
+              >
+                <LayoutTemplate className="size-4 text-blue-400" />
+                Pustaka Template (8+)
+              </button>
+              <button
+                type="button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={uploading}
                 className="focus-ring inline-flex h-11 items-center gap-2 rounded-xl border border-white/[0.1] bg-white/[0.025] px-4 text-[13px] font-medium text-zinc-300 transition hover:border-white/[0.16] hover:bg-white/[0.05] hover:text-white disabled:opacity-60"
@@ -600,26 +625,45 @@ export default function HomeScreen() {
         </section>
 
         <section aria-labelledby="projects-heading">
-          <div className="mb-5 flex items-end justify-between gap-4 border-t border-white/[0.07] pt-8">
-            <div>
-              <div className="mb-1.5 flex items-center gap-2">
-                <h2
-                  id="projects-heading"
-                  className="text-[17px] font-semibold tracking-[-0.025em] text-white"
-                >
-                  Project kamu
-                </h2>
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-4 border-t border-white/[0.07] pt-8">
+            <div className="flex items-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.02] p-1">
+              <button
+                type="button"
+                onClick={() => setMainTab("projects")}
+                data-testid="tab-projects"
+                className={cn(
+                  "focus-ring flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition",
+                  mainTab === "projects"
+                    ? "bg-white/[0.08] text-white shadow-sm"
+                    : "text-zinc-400 hover:text-zinc-200",
+                )}
+              >
+                <span>Project kamu</span>
                 {hydrated && projects.length > 0 ? (
-                  <span className="rounded-full border border-white/[0.07] bg-white/[0.025] px-2 py-0.5 text-[10px] tabular-nums text-zinc-500">
+                  <span className="rounded-full border border-white/[0.07] bg-white/[0.03] px-2 py-0.5 text-[10px] tabular-nums text-zinc-400">
                     {projects.length}
                   </span>
                 ) : null}
-              </div>
-              <p className="text-xs text-zinc-500">
-                Lanjutkan pekerjaan terakhir atau mulai project baru.
-              </p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMainTab("templates")}
+                data-testid="tab-templates"
+                className={cn(
+                  "focus-ring flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition",
+                  mainTab === "templates"
+                    ? "bg-blue-500/15 text-blue-300 shadow-sm"
+                    : "text-zinc-400 hover:text-zinc-200",
+                )}
+              >
+                <LayoutTemplate className="size-3.5 text-blue-400" />
+                <span>Pustaka Template</span>
+                <span className="rounded-full border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.2 text-[9px] font-medium text-blue-300">
+                  8+ Siap Pakai
+                </span>
+              </button>
             </div>
-            {projects.length > 0 ? (
+            {mainTab === "projects" && projects.length > 0 ? (
               <div className="hidden items-center gap-1.5 text-[10px] text-zinc-600 sm:flex">
                 <LayoutTemplate className="size-3" />
                 Disimpan otomatis
@@ -627,7 +671,11 @@ export default function HomeScreen() {
             ) : null}
           </div>
 
-          {!hydrated ? (
+          {mainTab === "templates" ? (
+            <div className="rounded-2xl border border-white/[0.07] bg-white/[0.01] p-4 sm:p-6">
+              <TemplateGallery isEmbedded />
+            </div>
+          ) : !hydrated ? (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {[0, 1, 2].map((item) => (
                 <div
@@ -647,8 +695,8 @@ export default function HomeScreen() {
                   Belum ada project
                 </h3>
                 <p className="mt-1.5 max-w-[320px] text-xs leading-5 text-zinc-500">
-                  Buat project pertamamu, impor HTML atau ZIP multi-file, lalu
-                  mulai mengedit secara visual.
+                  Buat project pertamamu, pilih dari template siap pakai, atau impor
+                  HTML/ZIP multi-file.
                 </p>
                 <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
                   <button
@@ -658,6 +706,14 @@ export default function HomeScreen() {
                   >
                     <Plus className="size-3.5" />
                     Buat project
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMainTab("templates")}
+                    className="focus-ring inline-flex h-9 items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3.5 text-xs font-medium text-blue-300 transition hover:bg-blue-500/15"
+                  >
+                    <LayoutTemplate className="size-3.5" />
+                    Pilih Template
                   </button>
                   <button
                     type="button"
@@ -844,6 +900,23 @@ export default function HomeScreen() {
                   </button>
                 );
               })}
+            </div>
+
+            <div className="mt-3 flex items-center justify-between rounded-xl border border-blue-500/20 bg-blue-500/[0.06] p-3 text-xs">
+              <div className="flex items-center gap-2 text-blue-300">
+                <LayoutTemplate className="size-4 shrink-0 text-blue-400" />
+                <span className="text-[11px]">Ingin website lengkap multi-halaman?</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setCreateOpen(false);
+                  setMainTab("templates");
+                }}
+                className="text-[11px] font-semibold text-blue-400 transition hover:text-blue-300 hover:underline"
+              >
+                Pustaka Template &rarr;
+              </button>
             </div>
           </div>
 

@@ -89,6 +89,7 @@ export async function createProjectBackupZip(
     versions: project.versions || [],
     pageOrder: project.pageOrder || [],
     globalTheme: project.globalTheme,
+    savedSections: project.savedSections || [],
   };
   zip.file(".kanvas/project.json", JSON.stringify(metadata, null, 2));
   entries.push(".kanvas/project.json");

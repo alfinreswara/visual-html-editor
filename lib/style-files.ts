@@ -4,10 +4,14 @@ import { hasStyleRule, upsertStyleRule } from "@/lib/css-rules";
 import {
   getReferencedStylesheetPaths,
   getTextFile,
+  isHtmlPath,
   makeTextFile,
   relativeProjectReference,
   type ProjectFiles,
 } from "@/lib/project-files";
+import { generateDesignSystemCss, type GlobalTheme } from "@/lib/design-system";
+
+export type { GlobalTheme };
 
 export interface StyleFileResult {
   files: ProjectFiles;
@@ -93,13 +97,6 @@ export function writeStyleRuleToProject(
   return { files: nextFiles, cssPath: targetPath, html: nextHtml };
 }
 
-export interface GlobalTheme {
-  primaryColor?: string;
-  textColor?: string;
-  headingFont?: string;
-  bodyFont?: string;
-}
-
 export const POPULAR_GOOGLE_FONTS = [
   "Inter",
   "Plus Jakarta Sans",
@@ -121,94 +118,100 @@ export function buildGoogleFontsUrl(fonts: string[]): string {
   return families ? `https://fonts.googleapis.com/css2?${families}&display=swap` : "";
 }
 
+function synchronizePageFontsAndStylesheet(
+  html: string,
+  htmlPath: string,
+  targetCssPath: string,
+  neededFonts: string[],
+): string {
+  let updatedHtml = html;
+  const relHref = relativeProjectReference(htmlPath, targetCssPath);
+  updatedHtml = ensureStylesheetLink(updatedHtml, relHref);
+
+  if (typeof DOMParser === "undefined") {
+    return updatedHtml;
+  }
+
+  const doc = new DOMParser().parseFromString(updatedHtml, "text/html");
+  const head = doc.head || doc.documentElement;
+
+  if (neededFonts.length > 0) {
+    const firstStyleOrScript = head.querySelector("style, script");
+    const insertTarget = firstStyleOrScript || null;
+
+    // 1. Ensure preconnects without duplicates
+    const existingPreconnects = Array.from(doc.querySelectorAll('link[rel="preconnect"]'));
+    const hasGoogleApis = existingPreconnects.some((link) =>
+      link.getAttribute("href")?.includes("fonts.googleapis.com"),
+    );
+    const hasGstatic = existingPreconnects.some((link) =>
+      link.getAttribute("href")?.includes("fonts.gstatic.com"),
+    );
+
+    if (!hasGoogleApis) {
+      const preconnect1 = doc.createElement("link");
+      preconnect1.setAttribute("rel", "preconnect");
+      preconnect1.setAttribute("href", "https://fonts.googleapis.com");
+      head.insertBefore(preconnect1, insertTarget);
+    }
+    if (!hasGstatic) {
+      const preconnect2 = doc.createElement("link");
+      preconnect2.setAttribute("rel", "preconnect");
+      preconnect2.setAttribute("href", "https://fonts.gstatic.com");
+      preconnect2.setAttribute("crossorigin", "");
+      head.insertBefore(preconnect2, insertTarget);
+    }
+
+    // 2. Ensure single font link without duplicate
+    const fontUrl = buildGoogleFontsUrl(neededFonts);
+    const existingFontLinks = Array.from(doc.querySelectorAll("link[data-kanvas-fonts]"));
+
+    // Remove extra duplicate font links if any exist
+    if (existingFontLinks.length > 1) {
+      for (let i = 1; i < existingFontLinks.length; i++) {
+        existingFontLinks[i].remove();
+      }
+    }
+
+    let fontLink = existingFontLinks[0];
+    if (!fontLink) {
+      fontLink = doc.createElement("link");
+      fontLink.setAttribute("rel", "stylesheet");
+      fontLink.setAttribute("data-kanvas-fonts", "");
+      head.insertBefore(fontLink, insertTarget);
+    }
+    fontLink.setAttribute("href", fontUrl);
+  } else {
+    // If no Google fonts needed, clean up any existing data-kanvas-fonts link
+    const existingFontLinks = Array.from(doc.querySelectorAll("link[data-kanvas-fonts]"));
+    for (const link of existingFontLinks) {
+      link.remove();
+    }
+  }
+
+  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`;
+}
+
 export function writeGlobalThemeToProject(
   files: ProjectFiles,
   htmlPath: string,
   theme: GlobalTheme,
 ): StyleFileResult | null {
-  const html = getTextFile(files, htmlPath);
-  if (html === null) return null;
+  const activeHtml = getTextFile(files, htmlPath);
+  if (activeHtml === null) return null;
 
   const stylesheetPaths = getReferencedStylesheetPaths(files, htmlPath);
   const targetPath = stylesheetPaths[0] || stylesheetCandidate(htmlPath);
 
-  let nextFiles = files;
-  let nextHtml = html;
+  let nextFiles = { ...files };
 
   if (!nextFiles[targetPath]) {
-    nextFiles = {
-      ...nextFiles,
-      [targetPath]: makeTextFile("", targetPath),
-    };
+    nextFiles[targetPath] = makeTextFile("", targetPath);
   }
 
-  const relHref = relativeProjectReference(htmlPath, targetPath);
-  nextHtml = ensureStylesheetLink(nextHtml, relHref);
-
-  const neededFonts = [theme.headingFont, theme.bodyFont].filter(
-    (f): f is string => Boolean(f && POPULAR_GOOGLE_FONTS.includes(f)),
-  );
-  if (neededFonts.length > 0 && typeof DOMParser !== "undefined") {
-    const doc = new DOMParser().parseFromString(nextHtml, "text/html");
-    const head = doc.head || doc.documentElement;
-    if (!doc.querySelector('link[href="https://fonts.googleapis.com"]')) {
-      const preconnect1 = doc.createElement("link");
-      preconnect1.setAttribute("rel", "preconnect");
-      preconnect1.setAttribute("href", "https://fonts.googleapis.com");
-      head.appendChild(preconnect1);
-      const preconnect2 = doc.createElement("link");
-      preconnect2.setAttribute("rel", "preconnect");
-      preconnect2.setAttribute("href", "https://fonts.gstatic.com");
-      preconnect2.setAttribute("crossorigin", "");
-      head.appendChild(preconnect2);
-    }
-    const fontUrl = buildGoogleFontsUrl(neededFonts);
-    let fontLink = doc.querySelector("link[data-kanvas-fonts]");
-    if (!fontLink) {
-      fontLink = doc.createElement("link");
-      fontLink.setAttribute("rel", "stylesheet");
-      fontLink.setAttribute("data-kanvas-fonts", "");
-      head.appendChild(fontLink);
-    }
-    fontLink.setAttribute("href", fontUrl);
-    nextHtml = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`;
-  }
-
-  if (nextHtml !== html) {
-    nextFiles = {
-      ...nextFiles,
-      [htmlPath]: makeTextFile(nextHtml, htmlPath),
-    };
-  }
-
+  // Update theme block in target stylesheet
   const currentCss = getTextFile(nextFiles, targetPath) ?? "";
-  const primary = theme.primaryColor || "#3b82f6";
-  const text = theme.textColor || "#17171c";
-  const heading = theme.headingFont ? `'${theme.headingFont}', sans-serif` : "system-ui, sans-serif";
-  const body = theme.bodyFont ? `'${theme.bodyFont}', sans-serif` : "system-ui, sans-serif";
-
-  const themeBlock = `/* --- KANVAS GLOBAL THEME --- */
-:root {
-  --primary: ${primary};
-  --text: ${text};
-  --font-heading: ${heading};
-  --font-body: ${body};
-}
-
-body {
-  color: var(--text);
-  font-family: var(--font-body);
-}
-
-h1, h2, h3, h4, h5, h6 {
-  font-family: var(--font-heading);
-}
-
-.btn-primary, button.primary {
-  background-color: var(--primary);
-  color: #ffffff;
-}
-/* --- END KANVAS GLOBAL THEME --- */`;
+  const themeBlock = generateDesignSystemCss(theme);
 
   let updatedCss = currentCss;
   const themeRegex = /\/\* --- KANVAS GLOBAL THEME --- \*\/[\s\S]*?\/\* --- END KANVAS GLOBAL THEME --- \*\//;
@@ -218,10 +221,40 @@ h1, h2, h3, h4, h5, h6 {
     updatedCss = `${themeBlock}\n\n${updatedCss}`;
   }
 
-  nextFiles = {
-    ...nextFiles,
-    [targetPath]: makeTextFile(updatedCss, targetPath),
-  };
+  nextFiles[targetPath] = makeTextFile(updatedCss, targetPath);
 
-  return { files: nextFiles, cssPath: targetPath, html: nextHtml };
+  // Also update any other stylesheets in project that contain the theme block
+  for (const [path, file] of Object.entries(nextFiles)) {
+    if (path !== targetPath && file.kind === "text" && path.endsWith(".css")) {
+      if (themeRegex.test(file.content)) {
+        nextFiles[path] = makeTextFile(
+          file.content.replace(themeRegex, themeBlock),
+          path,
+        );
+      }
+    }
+  }
+
+  const neededFonts = [theme.headingFont, theme.bodyFont].filter(
+    (f): f is string => Boolean(f && POPULAR_GOOGLE_FONTS.includes(f)),
+  );
+
+  // Synchronize ALL HTML pages in project files!
+  let nextActiveHtml = activeHtml;
+  for (const [path, file] of Object.entries(nextFiles)) {
+    if (isHtmlPath(path) && file.kind === "text") {
+      const updatedPage = synchronizePageFontsAndStylesheet(
+        file.content,
+        path,
+        targetPath,
+        neededFonts,
+      );
+      nextFiles[path] = makeTextFile(updatedPage, path);
+      if (path === htmlPath) {
+        nextActiveHtml = updatedPage;
+      }
+    }
+  }
+
+  return { files: nextFiles, cssPath: targetPath, html: nextActiveHtml };
 }

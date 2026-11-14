@@ -13,6 +13,7 @@ import {
   ChevronUp,
   Code2,
   Download,
+  ExternalLink,
   Eye,
   FileCode2,
   FileSearch,
@@ -21,6 +22,7 @@ import {
   History,
   Layers,
   LoaderCircle,
+  Maximize2,
   Monitor,
   MousePointer2,
   Palette,
@@ -29,6 +31,7 @@ import {
   PencilLine,
   Plus,
   Redo2,
+  RotateCw,
   ShieldCheck,
   SlidersHorizontal,
   Smartphone,
@@ -36,6 +39,9 @@ import {
   Tablet,
   Undo2,
   X,
+  ZoomIn,
+  ZoomOut,
+  LayoutTemplate,
   type LucideIcon,
 } from "lucide-react";
 import AddPanel from "@/components/editor/add-panel";
@@ -48,6 +54,7 @@ import PageManagerModal from "@/components/editor/page-manager-modal";
 import PageSettingsModal from "@/components/editor/page-settings-modal";
 import PropertiesPanel from "@/components/editor/properties-panel";
 import VersionHistoryModal from "@/components/editor/version-history-modal";
+import SaveTemplateModal from "@/components/templates/save-template-modal";
 import { Brand, BrandMark } from "@/components/brand";
 import { ToastViewport, useToast } from "@/components/ui/toast";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -60,14 +67,17 @@ import {
   duplicateElement,
   getElementCssSelector,
   getElementHtml,
+  getElementInlineStyles,
   insertElement,
   insertHtmlFragment,
+  isSafeHref,
   moveElement,
   moveElementTo,
   normalizePageHtml,
   replaceElementWithHtml,
   updateElementHref,
   updateElementImageSource,
+  updateElementInnerHtml,
   updateElementStyle,
   updateElementText,
   updateInternalLinks,
@@ -76,6 +86,7 @@ import {
 } from "@/lib/html";
 import {
   PREVIEW_CHANNEL,
+  STYLE_KEYS,
   parseBridgeMessage,
   type BridgeCommand,
   type ElementStyle,
@@ -84,7 +95,7 @@ import {
   type SelectedElement,
   type StyleKey,
 } from "@/lib/editor-messages";
-import { classSelectorFor } from "@/lib/css-rules";
+import { classSelectorFor, extractRulesForSelector } from "@/lib/css-rules";
 import { writeStyleRuleToProject } from "@/lib/style-files";
 import {
   bytesToBase64,
@@ -112,9 +123,18 @@ import {
 import { createProjectZip, createProjectBackupZip } from "@/lib/project-export";
 import { writeGlobalThemeToProject, type GlobalTheme } from "@/lib/style-files";
 import {
+  getUserSavedSections,
+  initSavedSectionsStorage,
+  saveUserSection,
+  deleteUserSection,
+  createSavedSectionFromHtml,
+  type SavedSection,
+} from "@/lib/saved-sections";
+import {
   buildProjectPreview,
   revokePreviewUrls,
 } from "@/lib/project-preview";
+import { runProjectAudit } from "@/lib/quality";
 import { cn } from "@/lib/utils";
 
 const CodePane = dynamic(() => import("@/components/editor/code-pane"), {
@@ -219,6 +239,10 @@ export default function EditorShell({ projectId }: { projectId: string }) {
   const [mode, setMode] = useState<Mode>("editing");
   const [view, setView] = useState<ViewMode>("preview");
   const [device, setDevice] = useState<DeviceMode>("desktop");
+  const [customViewportWidth, setCustomViewportWidth] = useState(1280);
+  const [customViewportHeight, setCustomViewportHeight] = useState(800);
+  const [isCustomViewport, setIsCustomViewport] = useState(false);
+  const [zoomPercent, setZoomPercent] = useState<number | "auto">("auto");
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [exporting, setExporting] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>(null);
@@ -239,6 +263,17 @@ export default function EditorShell({ projectId }: { projectId: string }) {
   const [pageManagerOpen, setPageManagerOpen] = useState(false);
   const [auditOpen, setAuditOpen] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
+  const [savedSections, setSavedSections] = useState<SavedSection[]>(() => {
+    if (typeof window === "undefined") return [];
+    return getUserSavedSections();
+  });
+
+  useEffect(() => {
+    void initSavedSectionsStorage().then((sections) => {
+      setSavedSections(sections);
+    });
+  }, []);
 
   useEffect(() => {
     if (!isResizing) return;
@@ -278,6 +313,7 @@ export default function EditorShell({ projectId }: { projectId: string }) {
   const mountedRef = useRef(true);
   const pendingSelectRef = useRef<{ id: string; scroll: boolean } | null>(null);
   const commandRef = useRef<(name: BridgeCommand) => void>(() => undefined);
+  const sessionTokenRef = useRef<string>("");
 
   const applySelection = useCallback((next: SelectedElement | null) => {
     selectionRef.current = next;
@@ -298,9 +334,13 @@ export default function EditorShell({ projectId }: { projectId: string }) {
     const frame = iframeRef.current;
     if (!frame?.contentWindow) return;
     try {
+      const payloadWithToken: ParentToBridgeMessage = {
+        ...message,
+        sessionToken: sessionTokenRef.current || undefined,
+      };
       // iframe sandbox + srcDoc punya origin opaque ("null") di sejumlah browser.
       // Bridge tetap memvalidasi event.source dan origin pesan masuk.
-      frame.contentWindow.postMessage(message, "*");
+      frame.contentWindow.postMessage(payloadWithToken, "*");
     } catch {
       // Preview mungkin sedang dimuat ulang.
     }
@@ -318,7 +358,17 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       options?: { selectId?: string | null; scroll?: boolean },
     ) => {
       try {
-        const preview = buildProjectPreview(files, htmlPath);
+        const token =
+          typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+        sessionTokenRef.current = token;
+        const parentOrigin = typeof window !== "undefined" ? window.location.origin : "*";
+        const preview = buildProjectPreview(files, htmlPath, {
+          sessionToken: token,
+          parentOrigin,
+          withBridge: true,
+        });
         revokePreviewUrls(previewUrlsRef.current);
         previewUrlsRef.current = preview.urls;
         pendingSelectRef.current = options?.selectId
@@ -468,6 +518,12 @@ export default function EditorShell({ projectId }: { projectId: string }) {
         };
 
         baseProjectRef.current = project;
+        if (project.savedSections && project.savedSections.length > 0) {
+          for (const sec of project.savedSections) {
+            saveUserSection(sec);
+          }
+          setSavedSections(getUserSavedSections());
+        }
         historyRef.current = initialHistory;
         nameRef.current = project.name;
         activeCodePathRef.current = activePath;
@@ -530,13 +586,15 @@ export default function EditorShell({ projectId }: { projectId: string }) {
 
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
-      // source harus tepat iframe preview. Origin app diperbolehkan, begitu juga
-      // "null" untuk srcdoc sandbox di browser yang memakai origin opaque.
+      // 1. Validasi origin: hanya origin aplikasi sendiri atau "null" (opaque origin pada sandboxed srcdoc)
       if (event.origin !== window.location.origin && event.origin !== "null") return;
+
+      // 2. Validasi window source: harus persis contentWindow dari iframe preview yang aktif
       const frameWindow = iframeRef.current?.contentWindow;
       if (!frameWindow || event.source !== frameWindow) return;
 
-      const message = parseBridgeMessage(event.data);
+      // 3. Validasi skema & token sesi unpredictable: tolak pesan usang (stale) atau unauthorized
+      const message = parseBridgeMessage(event.data, sessionTokenRef.current);
       if (!message) return;
 
       if (message.type === "ready") {
@@ -621,6 +679,15 @@ export default function EditorShell({ projectId }: { projectId: string }) {
         return;
       }
 
+      if (message.type === "move-to") {
+        handleMoveElementTo(
+          message.payload.sourceId,
+          message.payload.targetId,
+          message.payload.position,
+        );
+        return;
+      }
+
       if (message.type === "text") {
         const current = selectionRef.current;
         if (!current || current.id !== message.payload.id) return;
@@ -631,6 +698,20 @@ export default function EditorShell({ projectId }: { projectId: string }) {
         if (!next) return;
         writeFile(present.activePath, next);
         applySelection({ ...current, text: message.payload.text });
+        return;
+      }
+
+      if (message.type === "html") {
+        const current = selectionRef.current;
+        if (!current || current.id !== message.payload.id) return;
+        const present = historyRef.current.present;
+        const html = getTextFile(present.files, present.activePath);
+        if (html === null) return;
+        const next = updateElementInnerHtml(html, current.id, message.payload.html);
+        if (!next) return;
+        writeFile(present.activePath, next);
+        applySelection({ ...current, text: message.payload.html });
+        return;
       }
     }
 
@@ -681,6 +762,7 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       entry,
       activePath: snapshot.activePath,
       html: getTextFile(snapshot.files, entry) ?? "",
+      savedSections: savedSections.length > 0 ? savedSections : base.savedSections,
       updatedAt: Date.now(),
     };
   }
@@ -891,13 +973,59 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       return;
     }
 
+    // Jika scope bukan desktop (tablet atau mobile), periksa apakah elemen
+    // memiliki inline style untuk properti yang diubah.
+    // Pindahkan nilai inline desktop ke rule desktop di CSS dan bersihkan inline style-nya,
+    // sehingga CSS cascade dapat berjalan alami tanpa memerlukan !important.
+    if (scope !== "desktop") {
+      const inlineStyles = getElementInlineStyles(html, current.id);
+      const desktopMigrate: Partial<ElementStyle> = {};
+      const conflictingKeys: StyleKey[] = [];
+      for (const k of keys) {
+        if (inlineStyles[k]) {
+          desktopMigrate[k] = inlineStyles[k];
+          conflictingKeys.push(k);
+        }
+      }
+      if (conflictingKeys.length > 0) {
+        writeStyleRuleToProject(
+          present.files,
+          present.activePath,
+          selector,
+          desktopMigrate,
+          "desktop",
+          false,
+        );
+        postToPreview({
+          channel: PREVIEW_CHANNEL,
+          type: "set-css",
+          payload: { selector, scope: "desktop", styles: desktopMigrate },
+        });
+        const sourceHtml = getTextFile(present.files, present.activePath) ?? html;
+        const stripped = clearElementInlineStyles(sourceHtml, current.id, conflictingKeys);
+        if (stripped) {
+          const file = present.files[present.activePath];
+          if (file?.kind === "text") {
+            present.files[present.activePath] = { ...file, content: stripped };
+          }
+          const removals: Partial<ElementStyle> = {};
+          for (const key of conflictingKeys) removals[key] = "";
+          postToPreview({
+            channel: PREVIEW_CHANNEL,
+            type: "set-style",
+            payload: { id: current.id, styles: removals },
+          });
+        }
+      }
+    }
+
     const result = writeStyleRuleToProject(
       present.files,
       present.activePath,
       selector,
       styles,
       scope,
-      scope !== "desktop",
+      false,
     );
     if (!result) {
       toast("File CSS project tidak dapat diperbarui.", "error");
@@ -965,6 +1093,13 @@ export default function EditorShell({ projectId }: { projectId: string }) {
   function handleHrefChange(href: string) {
     const current = selectionRef.current;
     if (!current) return;
+    if (!isSafeHref(href)) {
+      toast(
+        "Protokol URL tidak aman (hanya http, https, mailto, tel, atau tautan relatif diizinkan).",
+        "error",
+      );
+      return;
+    }
     const present = historyRef.current.present;
     const html = getTextFile(present.files, present.activePath);
     if (html === null) return;
@@ -987,6 +1122,65 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       type: "select-parent",
       payload: { id: current.id },
     });
+  }
+
+  function handleSelectChild() {
+    const current = selectionRef.current;
+    if (!current) return;
+    postToPreview({
+      channel: PREVIEW_CHANNEL,
+      type: "select-child",
+      payload: { id: current.id },
+    });
+  }
+
+  function handleCopyElement() {
+    const current = selectionRef.current;
+    if (!current || modeRef.current !== "editing" || viewRef.current !== "preview") return;
+    const present = historyRef.current.present;
+    const html = getTextFile(present.files, present.activePath);
+    if (!html) return;
+    const elemHtml = getElementHtml(html, current.id);
+    if (elemHtml) {
+      const item = { html: elemHtml, tag: current.tag };
+      setClipboardElement(item);
+      try {
+        sessionStorage.setItem("kanvas.clipboard", JSON.stringify(item));
+      } catch {}
+      toast(`Elemen <${current.tag}> disalin.`, "info");
+    }
+  }
+
+  function handleCutElement() {
+    const current = selectionRef.current;
+    if (!current || modeRef.current !== "editing" || viewRef.current !== "preview") return;
+    handleCopyElement();
+    handleDeleteElement();
+    toast(`Elemen <${current.tag}> dipotong.`, "info");
+  }
+
+  function handlePasteElement() {
+    if (modeRef.current !== "editing" || viewRef.current !== "preview") return;
+    let item = clipboardElement;
+    if (!item) {
+      try {
+        const raw = sessionStorage.getItem("kanvas.clipboard");
+        if (raw) item = JSON.parse(raw);
+      } catch {}
+    }
+    if (!item) {
+      toast("Tidak ada elemen yang tersalin.", "info");
+      return;
+    }
+    const present = historyRef.current.present;
+    const html = getTextFile(present.files, present.activePath);
+    if (!html) return;
+    const targetId = selectionRef.current?.id || "body";
+    const pos: InsertPosition = selectionRef.current ? "after" : "inside";
+    const result = insertHtmlFragment(html, targetId, pos, item.html);
+    if (result) {
+      commitStructure(result, `Elemen <${item.tag}> ditempel.`);
+    }
   }
 
   function handleDeleteElement() {
@@ -1051,6 +1245,83 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       return;
     }
     commitStructure(result, "Elemen baru ditambahkan.");
+  }
+
+  function handleInsertComponent(
+    fragment: string,
+    position: InsertPosition,
+  ) {
+    const current = selectionRef.current;
+    const present = historyRef.current.present;
+    const html = getTextFile(present.files, present.activePath);
+    if (html === null) return;
+    const result = insertHtmlFragment(
+      html,
+      current?.id ?? null,
+      position,
+      fragment,
+    );
+    if (!result) {
+      toast(
+        "Komponen tidak dapat disisipkan di sana. Pilih container atau posisi lain.",
+        "error",
+      );
+      return;
+    }
+    commitStructure(result, "Komponen baru ditambahkan.");
+  }
+
+  function handleSaveSection(targetId?: string) {
+    const id = targetId || selectionRef.current?.id;
+    if (!id) {
+      toast("Pilih elemen atau section terlebih dahulu untuk disimpan.", "error");
+      return;
+    }
+    const present = historyRef.current.present;
+    const html = getTextFile(present.files, present.activePath);
+    if (html === null) return;
+    const elementHtml = getElementHtml(html, id);
+    if (!elementHtml) {
+      toast("Gagal mengekstrak HTML elemen.", "error");
+      return;
+    }
+
+    const tagMatch = elementHtml.match(/^<([a-z0-9-]+)/i);
+    const tag = tagMatch ? tagMatch[1].toLowerCase() : "section";
+    const textSnippet = elementHtml
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 30);
+    const defaultName = textSnippet
+      ? `${tag.toUpperCase()}: ${textSnippet}`
+      : `Section ${tag.toUpperCase()}`;
+
+    const name = window.prompt(
+      "Masukkan nama untuk section reusable ini:",
+      defaultName,
+    );
+    if (!name || name.trim() === "") return;
+
+    const saved = createSavedSectionFromHtml(name.trim(), elementHtml);
+    const updated = getUserSavedSections();
+    setSavedSections(updated);
+    if (baseProjectRef.current) {
+      baseProjectRef.current.savedSections = updated;
+      void saveProjectAsync(baseProjectRef.current);
+    }
+    toast(`Section "${saved.name}" berhasil disimpan ke pustaka!`, "success");
+  }
+
+  function handleDeleteSavedSection(id: string) {
+    deleteUserSection(id);
+    const updated = getUserSavedSections();
+    setSavedSections(updated);
+    if (baseProjectRef.current) {
+      baseProjectRef.current.savedSections = updated;
+      void saveProjectAsync(baseProjectRef.current);
+    }
+    toast("Section tersimpan berhasil dihapus.", "info");
   }
 
   function handleMoveElement(direction: "up" | "down") {
@@ -1280,44 +1551,22 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       }
       if (modifier && key === "c") {
         if (!selectionRef.current || modeRef.current !== "editing" || viewRef.current !== "preview") return;
-        const present = historyRef.current.present;
-        const html = getTextFile(present.files, present.activePath);
-        if (!html) return;
-        const elemHtml = getElementHtml(html, selectionRef.current.id);
-        if (elemHtml) {
-          event.preventDefault();
-          const item = { html: elemHtml, tag: selectionRef.current.tag };
-          setClipboardElement(item);
-          try {
-            sessionStorage.setItem("kanvas.clipboard", JSON.stringify(item));
-          } catch {}
-          toast(`Elemen <${selectionRef.current.tag}> disalin.`, "info");
-        }
+        event.preventDefault();
+        handleCopyElement();
+        return;
+      }
+
+      if (modifier && key === "x") {
+        if (!selectionRef.current || modeRef.current !== "editing" || viewRef.current !== "preview") return;
+        event.preventDefault();
+        handleCutElement();
         return;
       }
 
       if (modifier && key === "v") {
         if (modeRef.current !== "editing" || viewRef.current !== "preview") return;
-        let item = clipboardElement;
-        if (!item) {
-          try {
-            const raw = sessionStorage.getItem("kanvas.clipboard");
-            if (raw) item = JSON.parse(raw);
-          } catch {}
-        }
-        if (item) {
-          event.preventDefault();
-          const present = historyRef.current.present;
-          const html = getTextFile(present.files, present.activePath);
-          if (!html) return;
-          const targetId = selectionRef.current?.id || "body";
-          const pos = selectionRef.current ? "after" : "inside";
-          const result = insertHtmlFragment(html, targetId, pos, item.html);
-          if (result) {
-            commitStructure(result, `Elemen <${item.tag}> ditempel.`);
-            toast(`Elemen <${item.tag}> ditempel.`, "success");
-          }
-        }
+        event.preventDefault();
+        handlePasteElement();
         return;
       }
 
@@ -1374,6 +1623,11 @@ export default function EditorShell({ projectId }: { projectId: string }) {
     else if (name === "move-up") handleMoveElement("up");
     else if (name === "move-down") handleMoveElement("down");
     else if (name === "select-parent") handleSelectParent();
+    else if (name === "select-child") handleSelectChild();
+    else if (name === "copy") handleCopyElement();
+    else if (name === "cut") handleCutElement();
+    else if (name === "paste") handlePasteElement();
+    else if (name === "save-section") handleSaveSection();
   };
 
   function handleModeChange(nextMode: Mode) {
@@ -1414,6 +1668,20 @@ export default function EditorShell({ projectId }: { projectId: string }) {
     const present = historyRef.current.present;
     const file = present.files[path];
     if (!file) return;
+
+    if (view === "code") {
+      if (file.kind !== "text") {
+        toast(
+          `File ${path} adalah aset biner dan tidak bisa diedit di editor kode.`,
+          "info",
+        );
+        return;
+      }
+      activeCodePathRef.current = path;
+      setActiveCodePath(path);
+      if (window.innerWidth < 1280) setMobilePanel(null);
+      return;
+    }
 
     if (isHtmlPath(path)) {
       if (!navigateToPage(path)) {
@@ -1678,6 +1946,7 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       const present = historyRef.current.present;
       const base = baseProjectRef.current;
       if (!base) return;
+      base.savedSections = getUserSavedSections();
       const result = await createProjectBackupZip(base, present.files);
       const url = URL.createObjectURL(result.blob);
       const anchor = document.createElement("a");
@@ -1748,7 +2017,57 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       return a.localeCompare(b);
     });
   }, [history.present.files]);
-  const auditIssues = useMemo(() => auditHtml(activeHtml), [activeHtml]);
+  const qualityReport = useMemo(() => {
+    return runProjectAudit(history.present.files, { activePath });
+  }, [history.present.files, activePath]);
+  const auditIssues = qualityReport.issues;
+
+  const responsiveOverrides = useMemo(() => {
+    if (!selection) return {};
+    const present = history.present;
+    const html = getTextFile(present.files, present.activePath);
+    if (!html) return {};
+    const classes = selection.className.trim().split(/\s+/).filter(Boolean);
+    const selector = classes[0]
+      ? classSelectorFor(classes[0])
+      : getElementCssSelector(html, selection.id);
+    if (!selector) return {};
+
+    const referencedStylesheets = getReferencedStylesheets(
+      present.files,
+      present.activePath,
+    );
+    const overrides: Record<
+      string,
+      {
+        tablet?: boolean;
+        mobile?: boolean;
+        desktopVal?: string;
+        tabletVal?: string;
+        mobileVal?: string;
+      }
+    > = {};
+
+    for (const sheet of referencedStylesheets) {
+      const rules = extractRulesForSelector(sheet.content, selector);
+      for (const key of STYLE_KEYS) {
+        const tabVal = rules.tablet[key];
+        const mobVal = rules.mobile[key];
+        const deskVal = rules.desktop[key];
+        if (tabVal || mobVal) {
+          overrides[key] = {
+            tablet: Boolean(tabVal),
+            mobile: Boolean(mobVal),
+            desktopVal: deskVal,
+            tabletVal: tabVal,
+            mobileVal: mobVal,
+          };
+        }
+      }
+    }
+    return overrides;
+  }, [history.present, selection]);
+
   const canInsertInside = canInsertInsideTag(selection?.tag ?? "");
   if (loadState === "loading") return <EditorSkeleton />;
 
@@ -1781,9 +2100,80 @@ export default function EditorShell({ projectId }: { projectId: string }) {
   }
 
   const activeDevice = DEVICES.find((item) => item.id === device) ?? DEVICES[0];
-  const deviceWidth = Number.parseInt(activeDevice.width, 10) || 1280;
-  const previewScale =
-    stageWidth > 0 ? Math.min(1, stageWidth / deviceWidth) : 1;
+  const effectiveWidth = isCustomViewport ? customViewportWidth : (Number.parseInt(activeDevice.width, 10) || 1280);
+  const effectiveHeight = isCustomViewport ? customViewportHeight : 800;
+  const autoScale = stageWidth > 0 ? Math.min(1, stageWidth / effectiveWidth) : 1;
+  const previewScale = zoomPercent === "auto" ? autoScale : (zoomPercent / 100);
+
+  const ZOOM_PRESETS = [50, 75, 100, 125, 150];
+
+  function handleZoomIn() {
+    if (zoomPercent === "auto") {
+      const current = Math.round(autoScale * 100);
+      const next = ZOOM_PRESETS.find((z) => z > current) || 150;
+      setZoomPercent(next);
+    } else {
+      const next = ZOOM_PRESETS.find((z) => z > zoomPercent);
+      if (next) setZoomPercent(next);
+      else setZoomPercent(150);
+    }
+  }
+
+  function handleZoomOut() {
+    if (zoomPercent === "auto") {
+      const current = Math.round(autoScale * 100);
+      const prev = [...ZOOM_PRESETS].reverse().find((z) => z < current) || 50;
+      setZoomPercent(prev);
+    } else {
+      const prev = [...ZOOM_PRESETS].reverse().find((z) => z < zoomPercent);
+      if (prev) setZoomPercent(prev);
+      else setZoomPercent(50);
+    }
+  }
+
+  function handleOpenInNewTab() {
+    try {
+      const present = historyRef.current.present;
+      // Build clean preview document without editor bridge script
+      const preview = buildProjectPreview(present.files, present.activePath, {
+        withBridge: false,
+      });
+
+      // Inject restrictive Content Security Policy with sandbox directive
+      // to ensure the new tab executes with an isolated opaque origin ("null")
+      // and cannot access editor localStorage, IndexedDB, or cookies.
+      const cspMeta = `<meta http-equiv="Content-Security-Policy" content="sandbox allow-scripts allow-forms allow-modals; default-src 'self' 'unsafe-inline' data: blob: https: http:; object-src 'none';">`;
+      let isolatedHtml = preview.srcDoc;
+      if (/<head\b[^>]*>/i.test(isolatedHtml)) {
+        isolatedHtml = isolatedHtml.replace(/<head\b[^>]*>/i, (match) => `${match}\n  ${cspMeta}`);
+      } else {
+        isolatedHtml = `${cspMeta}\n${isolatedHtml}`;
+      }
+
+      const blob = new Blob([isolatedHtml], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+
+      // Open new tab with noopener, noreferrer to prevent window.opener exposure
+      const win = window.open(url, "_blank", "noopener,noreferrer");
+      if (win) {
+        try {
+          win.opener = null;
+        } catch {
+          // Opener sudah dinonaktifkan oleh browser.
+        }
+      } else {
+        toast("Popup diblokir peramban. Izinkan popup untuk membuka pratinjau.", "info");
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch {
+      toast("Gagal membuka pratinjau di tab baru.", "error");
+    }
+  }
+
+  function handleRefreshPreview() {
+    setPreviewKey((k) => k + 1);
+    toast("Preview dimuat ulang.", "info");
+  }
   const asideOpen = mobilePanel === "ai" || mobilePanel === "files";
 
   return (
@@ -1929,12 +2319,15 @@ export default function EditorShell({ projectId }: { projectId: string }) {
           <div className="hidden sm:flex shrink-0 items-center gap-0.5 rounded-lg border border-white/[0.08] bg-black/40 p-0.5">
             {DEVICES.map((item) => {
                const Icon = item.icon;
-               const active = device === item.id;
+               const active = !isCustomViewport && device === item.id;
                return (
                 <Tooltip key={item.id} content={`${item.label} (${item.hint})`}>
                   <button
                     type="button"
-                    onClick={() => setDevice(item.id)}
+                    onClick={() => {
+                      setIsCustomViewport(false);
+                      setDevice(item.id);
+                    }}
                     className={cn(
                       "focus-ring grid size-6 place-items-center rounded-[5px] transition",
                       active
@@ -1949,7 +2342,59 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                 </Tooltip>
               );
             })}
+
+            {/* Custom Viewport Toggle */}
+            <Tooltip content="Dimensi Kustom (Custom Width & Height)">
+              <button
+                type="button"
+                onClick={() => setIsCustomViewport(!isCustomViewport)}
+                data-testid="toggle-custom-viewport-btn"
+                className={cn(
+                  "focus-ring grid size-6 place-items-center rounded-[5px] transition",
+                  isCustomViewport
+                    ? "bg-blue-500/20 text-blue-300 shadow-sm"
+                    : "text-zinc-500 hover:text-zinc-300",
+                )}
+                aria-label="Ukuran Kustom"
+                aria-pressed={isCustomViewport}
+              >
+                <SlidersHorizontal className="size-3" />
+              </button>
+            </Tooltip>
           </div>
+
+          {/* Custom Dimension Inputs if isCustomViewport is active */}
+          {isCustomViewport && (
+            <div className="hidden md:flex items-center gap-1 font-mono text-[10px] text-zinc-300 bg-black/40 border border-white/[0.08] rounded-md px-2 py-0.5">
+              <input
+                type="number"
+                value={customViewportWidth}
+                onChange={(e) => {
+                  const val = Math.max(280, Math.min(3840, parseInt(e.target.value, 10) || 1280));
+                  setCustomViewportWidth(val);
+                  if (val <= 640) setDevice("mobile");
+                  else if (val <= 1024) setDevice("tablet");
+                  else setDevice("desktop");
+                }}
+                data-testid="custom-viewport-width"
+                className="w-12 bg-transparent text-right outline-none text-zinc-100"
+                title="Lebar kustom (px)"
+              />
+              <span className="text-zinc-600">&times;</span>
+              <input
+                type="number"
+                value={customViewportHeight}
+                onChange={(e) => {
+                  const val = Math.max(300, Math.min(2160, parseInt(e.target.value, 10) || 800));
+                  setCustomViewportHeight(val);
+                }}
+                data-testid="custom-viewport-height"
+                className="w-12 bg-transparent text-left outline-none text-zinc-100"
+                title="Tinggi kustom (px)"
+              />
+              <span className="text-zinc-500 text-[9px]">px</span>
+            </div>
+          )}
 
           {/* Viewport Scale Indicator */}
           <span className="hidden lg:inline-flex rounded border border-white/[0.06] bg-white/[0.02] px-1.5 py-0.5 font-mono text-[8.5px] text-zinc-500">
@@ -1986,14 +2431,15 @@ export default function EditorShell({ projectId }: { projectId: string }) {
           <span className="h-3.5 w-px shrink-0 bg-white/[0.08]" />
 
           {/* Audit / Pemeriksaan */}
-          <Tooltip content={`Pemeriksaan Aksesibilitas & Link (${auditIssues.length} isu)`}>
+          <Tooltip content={`Audit Kualitas Website (${auditIssues.length} temuan)`}>
             <button
               type="button"
               onClick={() => setAuditOpen(true)}
+              data-testid="open-audit-btn"
               className="focus-ring relative grid size-7 place-items-center rounded-md text-zinc-400 transition hover:bg-white/10 hover:text-white"
               aria-label="Pemeriksaan Audit"
             >
-              <ShieldCheck className="size-3.5" />
+              <ShieldCheck className="size-3.5 text-blue-400" />
               {auditIssues.length > 0 && (
                 <span className="absolute -top-0.5 -right-0.5 flex size-3 items-center justify-center rounded-full bg-amber-500 font-mono text-[7px] font-bold text-black">
                   {auditIssues.length}
@@ -2060,6 +2506,7 @@ export default function EditorShell({ projectId }: { projectId: string }) {
               <button
                 type="button"
                 onClick={() => setExportMenuOpen(!exportMenuOpen)}
+                data-testid="export-dropdown-toggle"
                 className="grid size-7 place-items-center border-l border-white/20 rounded-r-md transition hover:bg-[#2563eb]"
                 title="Pilihan ekspor lainnya"
               >
@@ -2100,6 +2547,21 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                     <div>
                       <div className="font-medium text-[11px]">Cadangan Proyek (.zip)</div>
                       <div className="text-[9.5px] text-zinc-400">Termasuk metadata & versi</div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExportMenuOpen(false);
+                      setSaveTemplateOpen(true);
+                    }}
+                    data-testid="save-as-template-menu-item"
+                    className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-zinc-200 hover:bg-white/10"
+                  >
+                    <LayoutTemplate className="size-3.5 text-amber-400" />
+                    <div>
+                      <div className="font-medium text-[11px]">Simpan sebagai Template</div>
+                      <div className="text-[9.5px] text-zinc-400">Jadikan template untuk dipakai ulang</div>
                     </div>
                   </button>
                 </div>
@@ -2311,7 +2773,10 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                   selectionId={selection?.id ?? null}
                   selectionTag={selection?.tag ?? null}
                   canInsertInside={canInsertInside}
+                  savedSections={savedSections}
                   onAdd={handleAddElement}
+                  onInsertHtml={handleInsertComponent}
+                  onDeleteSavedSection={handleDeleteSavedSection}
                 />
               )}
               {leftTab === "ai" && (
@@ -2356,19 +2821,20 @@ export default function EditorShell({ projectId }: { projectId: string }) {
 
               <div
                 ref={stageRef}
-                className="relative mx-auto flex h-full min-h-0 w-full flex-col transition-[max-width] duration-200 ease-out"
-                style={{ maxWidth: activeDevice.width }}
+                data-testid="preview-canvas-card"
+                className="preview-canvas-card relative mx-auto flex h-full min-h-0 w-full flex-col transition-[max-width] duration-200 ease-out"
+                style={{ maxWidth: isCustomViewport ? `${effectiveWidth}px` : activeDevice.width }}
               >
-                {/* Device Window Frame Header */}
-                <div className="flex h-8 shrink-0 items-center gap-2 rounded-t-xl border border-b-0 border-white/[0.09] bg-[#111115] px-3">
-                  <div className="flex items-center gap-1.5">
-                    <span className="size-1.5 rounded-full bg-[#ff6f70]/70" />
-                    <span className="size-1.5 rounded-full bg-[#f3c458]/70" />
-                    <span className="size-1.5 rounded-full bg-[#71d69a]/70" />
-                  </div>
-                  <span className="mx-0.5 h-3 w-px bg-white/[0.07]" />
-                  <div className="flex min-w-0 flex-1 items-center justify-center">
-                    <div className="flex h-5 max-w-[280px] flex-1 items-center justify-center gap-1.5 rounded-md border border-white/[0.055] bg-black/25 px-2 font-mono text-[8px] text-zinc-500">
+                {/* Device Window Frame Header with Advanced Preview Tools */}
+                <div className="flex h-8 shrink-0 items-center justify-between gap-2 rounded-t-xl border border-b-0 border-white/[0.09] bg-[#111115] px-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span className="size-1.5 rounded-full bg-[#ff6f70]/70" />
+                      <span className="size-1.5 rounded-full bg-[#f3c458]/70" />
+                      <span className="size-1.5 rounded-full bg-[#71d69a]/70" />
+                    </div>
+                    <span className="mx-0.5 h-3 w-px bg-white/[0.07] shrink-0" />
+                    <div className="flex h-5 max-w-[200px] sm:max-w-[260px] items-center gap-1.5 rounded-md border border-white/[0.055] bg-black/25 px-2 font-mono text-[8px] text-zinc-500">
                       <span className="size-1 shrink-0 rounded-full bg-emerald-400/70" />
                       <span className="truncate" title={activePath}>
                         {activePath || "Preview"}
@@ -2379,10 +2845,85 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                       </span>
                     </div>
                   </div>
-                  <span className="flex shrink-0 items-center gap-1 font-mono text-[8.5px] text-zinc-500">
-                    <MousePointer2 className="size-2.5" />
-                    {activeDevice.label}
-                  </span>
+
+                  {/* Right: Advanced Preview Tools (Zoom, Refresh, Open New Tab) */}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {/* Zoom Controls */}
+                    <div className="flex items-center gap-0.5 rounded-md border border-white/[0.07] bg-black/35 p-0.5 text-[9px] font-mono text-zinc-400">
+                      <button
+                        type="button"
+                        onClick={handleZoomOut}
+                        data-testid="preview-zoom-out-btn"
+                        className="grid size-4.5 place-items-center rounded hover:bg-white/10 hover:text-white"
+                        title="Perkecil zoom (-)"
+                      >
+                        <ZoomOut className="size-2.5" />
+                      </button>
+                      <select
+                        value={zoomPercent}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setZoomPercent(val === "auto" ? "auto" : parseInt(val, 10));
+                        }}
+                        data-testid="preview-zoom-select"
+                        className="h-4.5 bg-transparent px-1 text-[8.5px] outline-none text-zinc-300 hover:text-white cursor-pointer"
+                      >
+                        <option value="auto" className="bg-[#18181b]">Fit ({Math.round(autoScale * 100)}%)</option>
+                        <option value="50" className="bg-[#18181b]">50%</option>
+                        <option value="75" className="bg-[#18181b]">75%</option>
+                        <option value="100" className="bg-[#18181b]">100%</option>
+                        <option value="125" className="bg-[#18181b]">125%</option>
+                        <option value="150" className="bg-[#18181b]">150%</option>
+                      </select>
+                      <button
+                        type="button"
+                        onClick={handleZoomIn}
+                        data-testid="preview-zoom-in-btn"
+                        className="grid size-4.5 place-items-center rounded hover:bg-white/10 hover:text-white"
+                        title="Perbesar zoom (+)"
+                      >
+                        <ZoomIn className="size-2.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setZoomPercent("auto")}
+                        data-testid="preview-zoom-fit-btn"
+                        className={cn(
+                          "grid size-4.5 place-items-center rounded transition",
+                          zoomPercent === "auto" ? "text-blue-400" : "hover:bg-white/10 hover:text-white",
+                        )}
+                        title="Sesuaikan ke jendela (Fit)"
+                      >
+                        <Maximize2 className="size-2.5" />
+                      </button>
+                    </div>
+
+                    {/* Refresh Preview */}
+                    <button
+                      type="button"
+                      onClick={handleRefreshPreview}
+                      data-testid="preview-refresh-btn"
+                      className="grid size-5 place-items-center rounded-md border border-white/[0.07] bg-black/25 text-zinc-400 transition hover:bg-white/10 hover:text-white"
+                      title="Muat ulang preview"
+                    >
+                      <RotateCw className="size-2.5" />
+                    </button>
+
+                    {/* Open in New Tab */}
+                    <button
+                      type="button"
+                      onClick={handleOpenInNewTab}
+                      data-testid="preview-new-tab-btn"
+                      className="grid size-5 place-items-center rounded-md border border-white/[0.07] bg-black/25 text-zinc-400 transition hover:bg-white/10 hover:text-white"
+                      title="Buka pratinjau penuh di tab baru"
+                    >
+                      <ExternalLink className="size-2.5" />
+                    </button>
+
+                    <span className="hidden md:inline-flex items-center gap-1 font-mono text-[8.5px] text-zinc-500 pl-0.5">
+                      {isCustomViewport ? `${effectiveWidth}px` : activeDevice.label}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Iframe Preview Container */}
@@ -2392,11 +2933,11 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                     ref={iframeRef}
                     title="Preview halaman"
                     srcDoc={srcDoc}
-                    sandbox="allow-scripts allow-same-origin"
+                    sandbox="allow-scripts"
                     onLoad={handleFrameLoad}
                     className="h-full w-full border-0 bg-white"
                     style={{
-                      width: `${deviceWidth}px`,
+                      width: `${effectiveWidth}px`,
                       height: `${100 / previewScale}%`,
                       transform: `scale(${previewScale})`,
                       transformOrigin: "top left",
@@ -2508,12 +3049,14 @@ export default function EditorShell({ projectId }: { projectId: string }) {
               mode={mode}
               device={device}
               imagePaths={projectImagePaths}
+              responsiveOverrides={responsiveOverrides}
               onStyleChange={handleStyleChange}
               onTextChange={handleTextChange}
               onHrefChange={handleHrefChange}
               onImageUpload={(file) => void handleImageUpload(file)}
               onImageSelect={handleImageSelect}
               onSelectParent={handleSelectParent}
+              onSaveSection={selection ? () => handleSaveSection(selection.id) : undefined}
               onDelete={handleDeleteElement}
               onClose={() => setRightCollapsed(true)}
             />
@@ -2592,10 +3135,16 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                          selectionId={selection?.id ?? null}
                          selectionTag={selection?.tag ?? null}
                          canInsertInside={canInsertInside}
+                         savedSections={savedSections}
                          onAdd={(k, p) => {
                            handleAddElement(k, p);
                            setMobileDrawer(null);
                          }}
+                         onInsertHtml={(frag, p) => {
+                           handleInsertComponent(frag, p);
+                           setMobileDrawer(null);
+                         }}
+                         onDeleteSavedSection={handleDeleteSavedSection}
                        />
                      )}
                      {leftTab === "ai" && (
@@ -2616,12 +3165,14 @@ export default function EditorShell({ projectId }: { projectId: string }) {
                      mode={mode}
                      device={device}
                      imagePaths={projectImagePaths}
+                     responsiveOverrides={responsiveOverrides}
                      onStyleChange={handleStyleChange}
                      onTextChange={handleTextChange}
                      onHrefChange={handleHrefChange}
                      onImageUpload={(file) => void handleImageUpload(file)}
                      onImageSelect={handleImageSelect}
                      onSelectParent={handleSelectParent}
+                     onSaveSection={selection ? () => handleSaveSection(selection.id) : undefined}
                      onDelete={handleDeleteElement}
                      onClose={() => setMobileDrawer(null)}
                    />
@@ -2728,12 +3279,27 @@ export default function EditorShell({ projectId }: { projectId: string }) {
       <AuditModal
         open={auditOpen}
         onClose={() => setAuditOpen(false)}
+        files={history.present.files}
+        activePath={activePath}
         html={activeHtml}
         onSelectElement={(id) => {
           handleLayerSelect(id);
           setAuditOpen(false);
         }}
+        onNavigateToPage={(pagePath) => {
+          navigateToPage(pagePath);
+        }}
       />
+      <SaveTemplateModal
+        open={saveTemplateOpen}
+        onClose={() => setSaveTemplateOpen(false)}
+        files={history.present.files}
+        activePath={activePath}
+        projectName={name}
+        globalTheme={baseProjectRef.current?.globalTheme}
+        onSaved={(t) => toast(`Proyek berhasil disimpan sebagai template "${t.name}"!`, "success")}
+      />
+      <ToastViewport toasts={toasts} dismiss={dismiss} />
     </div>
   );
 }

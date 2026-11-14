@@ -61,6 +61,7 @@ export function ToastViewport({
         return (
           <div
             key={item.id}
+            role="status"
             className="animate-fade-in pointer-events-auto flex w-full max-w-sm items-start gap-2.5 rounded-xl border border-white/10 bg-[#18181d]/95 py-3 pl-3 pr-2 text-sm text-zinc-200 shadow-2xl backdrop-blur-xl"
           >
             <span

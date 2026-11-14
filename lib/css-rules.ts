@@ -494,3 +494,75 @@ export function hasStyleRule(
   if (!block) return false;
   return findRuleInRange(css, block.open + 1, block.close, selector) !== null;
 }
+
+export interface ScopeRules {
+  desktop: Partial<ElementStyle>;
+  tablet: Partial<ElementStyle>;
+  mobile: Partial<ElementStyle>;
+}
+
+export function extractRulesForSelector(
+  css: string,
+  selector: string,
+): ScopeRules {
+  const result: ScopeRules = {
+    desktop: {},
+    tablet: {},
+    mobile: {},
+  };
+
+  function parseBodyIntoStyles(body: string): Partial<ElementStyle> {
+    const decls = splitDeclarations(body);
+    const styles: Partial<ElementStyle> = {};
+    for (const decl of decls) {
+      const propLower = decl.property.toLowerCase();
+      for (const key of STYLE_KEYS) {
+        if (CSS_PROPERTIES[key].toLowerCase() === propLower) {
+          styles[key] = decl.value.replace(/!important/gi, "").trim();
+          break;
+        }
+      }
+    }
+    return styles;
+  }
+
+  // 1. Desktop
+  const topRule = findTopLevelRule(css, selector);
+  if (topRule) {
+    result.desktop = parseBodyIntoStyles(css.slice(topRule.open + 1, topRule.close));
+  }
+
+  // 2. Tablet
+  const tabletBlock = findMediaBlock(css, MEDIA_QUERIES.tablet);
+  if (tabletBlock) {
+    const tabletRule = findRuleInRange(
+      css,
+      tabletBlock.open + 1,
+      tabletBlock.close,
+      selector,
+    );
+    if (tabletRule) {
+      result.tablet = parseBodyIntoStyles(
+        css.slice(tabletRule.open + 1, tabletRule.close),
+      );
+    }
+  }
+
+  // 3. Mobile
+  const mobileBlock = findMediaBlock(css, MEDIA_QUERIES.mobile);
+  if (mobileBlock) {
+    const mobileRule = findRuleInRange(
+      css,
+      mobileBlock.open + 1,
+      mobileBlock.close,
+      selector,
+    );
+    if (mobileRule) {
+      result.mobile = parseBodyIntoStyles(
+        css.slice(mobileRule.open + 1, mobileRule.close),
+      );
+    }
+  }
+
+  return result;
+}

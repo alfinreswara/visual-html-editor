@@ -1,6 +1,7 @@
 import { BRIDGE_SCRIPT } from "@/lib/bridge";
 import {
   CSS_PROPERTIES,
+  STYLE_KEYS,
   type ElementStyle,
   type StyleKey,
 } from "@/lib/editor-messages";
@@ -37,7 +38,7 @@ function assignIds(doc: Document): void {
 
 function stripEditorArtifacts(doc: Document): void {
   doc.querySelectorAll(
-    "[data-ve-bridge], [data-ve-ui], #__ve_bridge__, #__ve_label, #__ve_toolbar",
+    "[data-ve-bridge], [data-ve-ui], #__ve_bridge__, #__ve_label, #__ve_toolbar, #__ve_context_menu, #__ve_drop_indicator, #__ve_drop_badge, #__ve_resize_box, #__ve_size_badge, #__ve_rich_text_toolbar",
   ).forEach((element) => element.remove());
 
   doc.querySelectorAll("*").forEach((element) => {
@@ -89,7 +90,10 @@ export function cleanEditorArtifacts(html: string): string {
   return serialize(doc);
 }
 
-export function buildPreviewDocument(html: string): string {
+export function buildPreviewDocument(
+  html: string,
+  options?: { sessionToken?: string; parentOrigin?: string },
+): string {
   const doc = docWithIds(html);
 
   // CSP milik halaman bisa memblokir bridge inline. Atribut ini hanya
@@ -102,7 +106,9 @@ export function buildPreviewDocument(html: string): string {
   const script = doc.createElement("script");
   script.id = "__ve_bridge__";
   script.setAttribute("data-ve-bridge", "");
-  script.textContent = BRIDGE_SCRIPT;
+  const sessionTokenJson = JSON.stringify(options?.sessionToken || "");
+  const parentOriginJson = JSON.stringify(options?.parentOrigin || "*");
+  script.textContent = `window.__KANVAS_SESSION_TOKEN__ = ${sessionTokenJson};\nwindow.__KANVAS_PARENT_ORIGIN__ = ${parentOriginJson};\n${BRIDGE_SCRIPT}`;
   doc.body.appendChild(script);
 
   return serialize(doc);
@@ -165,6 +171,52 @@ export function updateElementText(
   });
 }
 
+export function isSafeHref(href: string): boolean {
+  const trimmed = href.trim();
+  if (!trimmed) return true;
+  return !/^\s*(?:javascript|vbscript|data):/i.test(trimmed);
+}
+
+export function sanitizeRichText(html: string): string {
+  let clean = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
+  clean = clean.replace(/\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  clean = clean.replace(
+    /\b(href|src)\s*=\s*(?:"\s*(?:javascript|vbscript|data):[^"]*"|'\s*(?:javascript|vbscript|data):[^']*'|(?:javascript|vbscript|data):[^\s>]*)/gi,
+    '$1=""',
+  );
+  return clean;
+}
+
+export function updateElementInnerHtml(
+  html: string,
+  id: string,
+  innerHtml: string,
+): string | null {
+  const sanitized = sanitizeRichText(innerHtml);
+  return updateElementSource(html, id, (element) => {
+    element.innerHTML = sanitized;
+  });
+}
+
+export function getElementInlineStyles(
+  html: string,
+  id: string,
+): Partial<ElementStyle> {
+  const doc = docWithIds(html);
+  const element = findById(doc, id) as HTMLElement | null;
+  if (!element) return {};
+  const styles: Partial<ElementStyle> = {};
+  const elStyle = element.style;
+  for (const key of STYLE_KEYS) {
+    const prop = CSS_PROPERTIES[key];
+    const val = elStyle.getPropertyValue(prop);
+    if (val) {
+      styles[key] = val.trim();
+    }
+  }
+  return styles;
+}
+
 export function updateElementHref(
   html: string,
   id: string,
@@ -174,8 +226,12 @@ export function updateElementHref(
     const tag = element.tagName.toLowerCase();
     if (tag !== "a" && tag !== "button") return;
     const value = href.trim();
-    if (value) element.setAttribute("href", value);
-    else element.removeAttribute("href");
+    if (value) {
+      if (!isSafeHref(value)) return;
+      element.setAttribute("href", value);
+    } else {
+      element.removeAttribute("href");
+    }
     element.removeAttribute("data-href");
   });
 }
@@ -493,6 +549,161 @@ export function insertElement(
   });
 }
 
+/**
+ * Ensures any element IDs in an incoming fragment or duplicated tree are unique
+ * within the destination document, while rewriting internal references (href="#...",
+ * label for="...", aria-labelledby/describedby/controls, SVG url(#...)) to preserve
+ * intra-element relationships without touching external references.
+ */
+export function deduplicateFragmentIds(
+  doc: Document,
+  roots: Element[],
+): Map<string, string> {
+  const existingIds = new Set<string>();
+  for (const el of Array.from(doc.querySelectorAll("[id]"))) {
+    const id = el.getAttribute("id");
+    if (id) existingIds.add(id.trim());
+  }
+
+  // Collect all elements in the incoming fragment
+  const allFragmentElements: Element[] = [];
+  for (const root of roots) {
+    allFragmentElements.push(root);
+    allFragmentElements.push(...Array.from(root.querySelectorAll("*")));
+  }
+
+  // Identify all IDs defined in the fragment
+  const fragmentIds = new Set<string>();
+  for (const el of allFragmentElements) {
+    const id = el.getAttribute("id");
+    if (id && id.trim()) {
+      fragmentIds.add(id.trim());
+    }
+  }
+
+  if (fragmentIds.size === 0) {
+    return new Map();
+  }
+
+  const idMap = new Map<string, string>();
+  const claimedIds = new Set<string>(existingIds);
+
+  for (const oldId of fragmentIds) {
+    // If oldId already exists in document, or was claimed by another node in the fragment
+    if (claimedIds.has(oldId)) {
+      const match = oldId.match(/^(.*?)(?:-(\d+))?$/);
+      const prefix = match ? match[1] : oldId;
+      let counter = match && match[2] ? parseInt(match[2], 10) + 1 : 1;
+
+      let candidate = `${prefix}-${counter}`;
+      while (claimedIds.has(candidate)) {
+        counter++;
+        candidate = `${prefix}-${counter}`;
+      }
+
+      idMap.set(oldId, candidate);
+      claimedIds.add(candidate);
+    } else {
+      claimedIds.add(oldId);
+    }
+  }
+
+  if (idMap.size === 0) {
+    return idMap;
+  }
+
+  // Rewrite internal attributes across the fragment
+  function replaceUrlRefs(val: string): string {
+    return val.replace(/url\(\s*#([^)]+)\s*\)/g, (full, targetId) => {
+      const mapped = idMap.get(targetId);
+      return mapped ? `url(#${mapped})` : full;
+    });
+  }
+
+  for (const el of allFragmentElements) {
+    // 1. Element ID
+    const currentId = el.getAttribute("id");
+    if (currentId && idMap.has(currentId)) {
+      el.setAttribute("id", idMap.get(currentId)!);
+    }
+
+    // 2. Label `for`
+    if (el.hasAttribute("for")) {
+      const targetId = el.getAttribute("for")!;
+      if (idMap.has(targetId)) {
+        el.setAttribute("for", idMap.get(targetId)!);
+      }
+    }
+
+    // 3. Anchor or SVG use `href`
+    if (el.hasAttribute("href")) {
+      const href = el.getAttribute("href")!;
+      if (href.startsWith("#")) {
+        const targetId = href.slice(1);
+        if (idMap.has(targetId)) {
+          el.setAttribute("href", `#${idMap.get(targetId)!}`);
+        }
+      }
+    }
+
+    // 4. SVG `xlink:href`
+    if (el.hasAttribute("xlink:href")) {
+      const href = el.getAttribute("xlink:href")!;
+      if (href.startsWith("#")) {
+        const targetId = href.slice(1);
+        if (idMap.has(targetId)) {
+          el.setAttribute("xlink:href", `#${idMap.get(targetId)!}`);
+        }
+      }
+    }
+
+    // 5. Space-separated reference attributes
+    for (const attr of [
+      "aria-labelledby",
+      "aria-describedby",
+      "aria-controls",
+      "headers",
+    ]) {
+      if (el.hasAttribute(attr)) {
+        const val = el.getAttribute(attr)!;
+        const tokens = val
+          .split(/\s+/)
+          .map((tok) => idMap.get(tok) || tok);
+        el.setAttribute(attr, tokens.join(" "));
+      }
+    }
+
+    // 6. Single-ID references: list, form
+    for (const attr of ["list", "form"]) {
+      if (el.hasAttribute(attr)) {
+        const val = el.getAttribute(attr)!;
+        if (idMap.has(val)) {
+          el.setAttribute(attr, idMap.get(val)!);
+        }
+      }
+    }
+
+    // 7. SVG presentation attributes & CSS URL references
+    for (const attr of [
+      "clip-path",
+      "mask",
+      "fill",
+      "filter",
+      "marker-start",
+      "marker-end",
+      "marker-mid",
+      "stroke",
+      "style",
+    ]) {
+      if (el.hasAttribute(attr)) {
+        el.setAttribute(attr, replaceUrlRefs(el.getAttribute(attr)!));
+      }
+    }
+  }
+
+  return idMap;
+}
+
 export function insertHtmlFragment(
   html: string,
   id: string | null,
@@ -507,7 +718,8 @@ export function insertHtmlFragment(
     const roots = Array.from(fragmentDoc.body.children);
     if (roots.length === 0) return null;
 
-    const nodes = roots.map((node) => doc.importNode(node, true));
+    const nodes = roots.map((node) => doc.importNode(node, true) as Element);
+    deduplicateFragmentIds(doc, nodes);
     const targetTag = target.tagName.toLowerCase();
 
     if (position === "after" && target !== doc.body) {
@@ -536,7 +748,7 @@ export function duplicateElement(
 
     const clone = element.cloneNode(true) as Element;
     clearEditorAttributes(clone);
-    clearIdAttributes(clone);
+    deduplicateFragmentIds(doc, [clone]);
     element.after(clone);
     return clone;
   });
@@ -671,7 +883,8 @@ export function ensureStylesheetLink(html: string, href: string): string {
   const link = doc.createElement("link");
   link.setAttribute("rel", "stylesheet");
   link.setAttribute("href", href);
-  head.appendChild(link);
+  const firstStyleOrScript = head.querySelector("style, script");
+  head.insertBefore(link, firstStyleOrScript || null);
   return serialize(doc);
 }
 
@@ -839,6 +1052,7 @@ export interface AuditIssue {
 }
 
 export function auditHtml(html: string): AuditIssue[] {
+  if (typeof DOMParser === "undefined" || !html) return [];
   const doc = docWithIds(html);
   const issues: AuditIssue[] = [];
 
